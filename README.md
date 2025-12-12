@@ -22,7 +22,7 @@ curl -O https://raw.githubusercontent.com/EWANZO101/snailybot1/main/snailycad-bo
 ### Option 2: Clone Repository Method
 
 ```bash
-git clone https://github.com/EWANZO101/snailybot1.git
+git clone https://github.com/EWANZO101/snailybot1/blob/main/bot.sh.git
 cd snailybot1
 chmod +x snailycad-bot-setup.sh
 ./snailycad-bot-setup.sh
