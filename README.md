@@ -22,14 +22,9 @@ curl -O https://raw.githubusercontent.com/EWANZO101/snailybot1/main/snailycad-bo
 ### Option 2: Clone Repository Method
 
 ```bash
-# Clone the setup repository
 git clone https://github.com/EWANZO101/snailybot1.git
 cd snailybot1
-
-# Make script executable
 chmod +x snailycad-bot-setup.sh
-
-# Run the setup
 ./snailycad-bot-setup.sh
 ```
 
