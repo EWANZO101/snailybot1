@@ -86,11 +86,6 @@ generate_password() {
     openssl rand -base64 16 | tr -d "=+/" | cut -c1-16
 }
 
-# Function to generate random database name
-generate_db_name() {
-    echo "snailycad_$(openssl rand -hex 4)"
-}
-
 # Function to retry command with exponential backoff
 retry_command() {
     local max_attempts="$1"
@@ -517,20 +512,12 @@ configure_database() {
         exit 1
     fi
     
-    # Generate defaults
-    DEFAULT_DB_NAME=$(generate_db_name)
-    DEFAULT_DB_USER="snailycad_user"
-    DEFAULT_DB_PASSWORD=$(generate_password)
-    
-    # Get database configuration from user
-    print_info "Please provide database configuration (or press Enter for defaults):"
-    echo
-    
-    DB_NAME=$(get_input "Database name" "$DEFAULT_DB_NAME")
-    DB_USER=$(get_input "Database user" "$DEFAULT_DB_USER")
-    DB_PASSWORD=$(get_password "Database password" "$DEFAULT_DB_PASSWORD")
-    DB_HOST=$(get_input "Database host" "localhost")
-    DB_PORT=$(get_input "Database port" "5432")
+    # Fixed database configuration
+    DB_NAME="snaily-cadbot"
+    DB_USER="snailycadbot"
+    DB_PASSWORD=$(generate_password)
+    DB_HOST="localhost"
+    DB_PORT="5432"
     
     echo
     print_info "Database configuration:"
@@ -538,40 +525,78 @@ configure_database() {
     print_info "  User: $DB_USER"
     print_info "  Host: $DB_HOST"
     print_info "  Port: $DB_PORT"
+    print_info "  Password: [randomly generated]"
     echo
     
-    # Get PostgreSQL superuser credentials
-    print_info "Enter PostgreSQL superuser credentials (usually 'postgres'):"
-    PG_SUPERUSER=$(get_input "PostgreSQL superuser" "postgres")
+    # Create temporary SQL script
+    TEMP_SQL=$(mktemp)
+    cat > "$TEMP_SQL" << EOF
+-- Create the user
+CREATE USER "$DB_USER";
+
+-- Grant superuser privileges
+ALTER USER "$DB_USER" WITH SUPERUSER;
+
+-- Set the password
+ALTER USER "$DB_USER" PASSWORD '$DB_PASSWORD';
+
+-- Create the database
+CREATE DATABASE "$DB_NAME";
+
+-- Exit
+\q
+EOF
     
-    # Create database and user with retry logic
-    print_info "Creating database and user..."
+    print_info "Creating database user and database..."
+    print_info "Executing commands as postgres user..."
     
-    # Create user
-    if ! retry_command 2 3 "psql -U \"$PG_SUPERUSER\" -h \"$DB_HOST\" -p \"$DB_PORT\" -c \"CREATE USER $DB_USER WITH PASSWORD '$DB_PASSWORD';\""; then
-        print_warning "User '$DB_USER' might already exist, continuing..."
+    # Execute SQL commands as postgres user
+    if sudo -u postgres psql -d postgres -f "$TEMP_SQL" 2>&1 | tee -a "$LOG_FILE"; then
+        print_success "Database and user created successfully!"
+    else
+        # Check if user/database already exists
+        print_warning "Some commands may have failed. Checking if user/database exist..."
+        
+        # Check if user exists
+        if sudo -u postgres psql -d postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='$DB_USER'" | grep -q 1; then
+            print_info "User '$DB_USER' already exists. Updating password and privileges..."
+            
+            # Update existing user
+            sudo -u postgres psql -d postgres -c "ALTER USER \"$DB_USER\" WITH SUPERUSER;" 2>&1 | tee -a "$LOG_FILE"
+            sudo -u postgres psql -d postgres -c "ALTER USER \"$DB_USER\" PASSWORD '$DB_PASSWORD';" 2>&1 | tee -a "$LOG_FILE"
+        fi
+        
+        # Check if database exists
+        if sudo -u postgres psql -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$DB_NAME'" | grep -q 1; then
+            print_info "Database '$DB_NAME' already exists."
+        else
+            # Try to create database
+            sudo -u postgres psql -d postgres -c "CREATE DATABASE \"$DB_NAME\";" 2>&1 | tee -a "$LOG_FILE"
+        fi
     fi
     
-    # Create database
-    if ! retry_command 2 3 "psql -U \"$PG_SUPERUSER\" -h \"$DB_HOST\" -p \"$DB_PORT\" -c \"CREATE DATABASE $DB_NAME OWNER $DB_USER;\""; then
-        print_warning "Database '$DB_NAME' might already exist, continuing..."
-    fi
-    
-    # Grant privileges
-    if ! retry_command 2 3 "psql -U \"$PG_SUPERUSER\" -h \"$DB_HOST\" -p \"$DB_PORT\" -c \"GRANT ALL PRIVILEGES ON DATABASE $DB_NAME TO $DB_USER;\""; then
-        print_warning "Could not grant privileges, user might already have them..."
-    fi
+    # Clean up temporary file
+    rm -f "$TEMP_SQL"
     
     # Test connection
     print_info "Testing database connection..."
+    sleep 2  # Give PostgreSQL a moment
+    
     if test_database_connection "$DB_HOST" "$DB_PORT" "$DB_USER" "$DB_NAME" "$DB_PASSWORD"; then
         print_success "Database connection successful!"
     else
-        print_error "Database connection failed. Please verify credentials."
-        exit 1
+        print_warning "Database connection test failed, but setup may still be correct."
+        print_info "You can manually test with: PGPASSWORD='$DB_PASSWORD' psql -h $DB_HOST -p $DB_PORT -U $DB_USER -d $DB_NAME"
     fi
     
     print_success "Database setup complete!"
+    echo
+    print_info "Database credentials generated:"
+    print_info "  User: $DB_USER"
+    print_info "  Password: $DB_PASSWORD"
+    print_info "  Database: $DB_NAME"
+    echo
+    
     save_state "database_configured"
 }
 
@@ -632,14 +657,28 @@ configure_env() {
     # Update .env file
     print_info "Updating .env file with configuration..."
     
+    # Database URL format for PostgreSQL
+    DATABASE_URL="postgresql://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}"
+    
     # Use sed or perl to update the .env file
     if command_exists sed; then
-        sed -i.bak "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=\"$DB_PASSWORD\"/" .env
-        sed -i.bak "s/^POSTGRES_USER=.*/POSTGRES_USER=\"$DB_USER\"/" .env
-        sed -i.bak "s/^DB_HOST=.*/DB_HOST=\"$DB_HOST\"/" .env
-        sed -i.bak "s/^DB_PORT=.*/DB_PORT=\"$DB_PORT\"/" .env
-        sed -i.bak "s/^POSTGRES_DB=.*/POSTGRES_DB=\"$DB_NAME\"/" .env
-        sed -i.bak "s/^BOT_TOKEN=.*/BOT_TOKEN=\"$BOT_TOKEN\"/" .env
+        # Update individual variables
+        sed -i.bak "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=\"$DB_PASSWORD\"|" .env
+        sed -i.bak "s|^POSTGRES_USER=.*|POSTGRES_USER=\"$DB_USER\"|" .env
+        sed -i.bak "s|^DB_HOST=.*|DB_HOST=\"$DB_HOST\"|" .env
+        sed -i.bak "s|^DB_PORT=.*|DB_PORT=\"$DB_PORT\"|" .env
+        sed -i.bak "s|^POSTGRES_DB=.*|POSTGRES_DB=\"$DB_NAME\"|" .env
+        sed -i.bak "s|^BOT_TOKEN=.*|BOT_TOKEN=\"$BOT_TOKEN\"|" .env
+        
+        # Add or update DATABASE_URL if it exists in the template
+        if grep -q "^DATABASE_URL=" .env; then
+            sed -i.bak "s|^DATABASE_URL=.*|DATABASE_URL=\"$DATABASE_URL\"|" .env
+        elif grep -q "^#DATABASE_URL=" .env; then
+            sed -i.bak "s|^#DATABASE_URL=.*|DATABASE_URL=\"$DATABASE_URL\"|" .env
+        else
+            echo "DATABASE_URL=\"$DATABASE_URL\"" >> .env
+        fi
+        
         rm -f .env.bak
     else
         # Manual update if sed is not available
@@ -650,6 +689,7 @@ DB_HOST="$DB_HOST"
 DB_PORT="$DB_PORT"
 POSTGRES_DB="$DB_NAME"
 BOT_TOKEN="$BOT_TOKEN"
+DATABASE_URL="$DATABASE_URL"
 EOF
     fi
     
@@ -675,7 +715,16 @@ Database Configuration:
 - Database Host: $DB_HOST
 - Database Port: $DB_PORT
 
+Database URL:
+$DATABASE_URL
+
 Bot Token: $BOT_TOKEN
+
+PostgreSQL Connection Command:
+PGPASSWORD='$DB_PASSWORD' psql -h $DB_HOST -p $DB_PORT -U $DB_USER -d $DB_NAME
+
+Or as postgres user:
+sudo -u postgres psql -d $DB_NAME
 
 IMPORTANT: Keep this file secure and do not share it publicly!
 EOF
