@@ -609,13 +609,33 @@ validate_env_file() {
         return 1
     fi
     
+    # Check file is readable
+    if [ ! -r ".env" ]; then
+        print_error ".env file is not readable"
+        # Try to fix permissions
+        chmod 644 .env 2>/dev/null || return 1
+    fi
+    
+    # Check file is not empty
+    if [ ! -s ".env" ]; then
+        print_error ".env file is empty"
+        return 1
+    fi
+    
     # Check for required variables
     local required_vars=("POSTGRES_PASSWORD" "POSTGRES_USER" "DB_HOST" "DB_PORT" "POSTGRES_DB" "BOT_TOKEN")
     local missing_vars=()
+    local empty_vars=()
     
     for var in "${required_vars[@]}"; do
         if ! grep -q "^${var}=" .env; then
             missing_vars+=("$var")
+        else
+            # Check if variable has a value (not empty or just whitespace)
+            local value=$(grep "^${var}=" .env | cut -d'=' -f2- | tr -d '"' | tr -d "'" | xargs)
+            if [ -z "$value" ]; then
+                empty_vars+=("$var")
+            fi
         fi
     done
     
@@ -624,17 +644,102 @@ validate_env_file() {
         return 1
     fi
     
-    print_success ".env file validated"
+    if [ ${#empty_vars[@]} -ne 0 ]; then
+        print_warning "Empty variables in .env: ${empty_vars[*]}"
+        # Empty BOT_TOKEN is acceptable at this stage if not set yet
+        for var in "${empty_vars[@]}"; do
+            if [ "$var" != "BOT_TOKEN" ]; then
+                print_error "Critical variable $var is empty"
+                return 1
+            fi
+        done
+    fi
+    
+    # Validate format of certain variables
+    local db_port=$(grep "^DB_PORT=" .env | cut -d'=' -f2- | tr -d '"' | tr -d "'")
+    if [ -n "$db_port" ] && ! [[ "$db_port" =~ ^[0-9]+$ ]]; then
+        print_error "DB_PORT must be a number, got: $db_port"
+        return 1
+    fi
+    
+    print_success ".env file validated successfully"
     return 0
+}
+
+# Function to heal .env.example file
+heal_env_example() {
+    print_healing "Checking for .env.example file..."
+    
+    if [ -f ".env.example" ]; then
+        print_success ".env.example file exists"
+        return 0
+    fi
+    
+    print_warning ".env.example file not found!"
+    print_healing "Attempting to restore .env.example..."
+    
+    # Try to get it from git
+    if [ -d ".git" ]; then
+        print_info "Attempting to restore from git..."
+        if git checkout HEAD -- .env.example 2>/dev/null; then
+            print_success "Restored .env.example from git"
+            return 0
+        fi
+    fi
+    
+    # Try to download from GitHub
+    print_info "Attempting to download from GitHub..."
+    local repo_url="https://raw.githubusercontent.com/SnailyCAD/snailycad-bot/main/.env.example"
+    
+    if retry_command 2 3 "curl -fsSL '$repo_url' -o .env.example"; then
+        print_success "Downloaded .env.example from GitHub"
+        return 0
+    fi
+    
+    # Try alternative branch names
+    print_info "Trying alternative branch..."
+    repo_url="https://raw.githubusercontent.com/SnailyCAD/snailycad-bot/master/.env.example"
+    
+    if retry_command 2 3 "curl -fsSL '$repo_url' -o .env.example"; then
+        print_success "Downloaded .env.example from GitHub (master branch)"
+        return 0
+    fi
+    
+    # If all else fails, create a basic template
+    print_warning "Could not download .env.example, creating basic template..."
+    cat > .env.example << 'EOF'
+# Database Configuration
+POSTGRES_PASSWORD=
+POSTGRES_USER=
+DB_HOST=localhost
+DB_PORT=5432
+POSTGRES_DB=
+DATABASE_URL=
+
+# Bot Configuration
+BOT_TOKEN=
+
+# Optional Configuration
+NODE_ENV=production
+LOG_LEVEL=info
+EOF
+    
+    if [ -f ".env.example" ]; then
+        print_success "Created basic .env.example template"
+        return 0
+    else
+        print_error "Failed to create .env.example"
+        return 1
+    fi
 }
 
 # Function to configure .env file with validation
 configure_env() {
     print_info "Configuring environment variables..."
     
-    # Check if .env.example exists
-    if [ ! -f ".env.example" ]; then
-        print_error ".env.example file not found!"
+    # Heal .env.example if needed
+    if ! heal_env_example; then
+        print_error "Cannot proceed without .env.example file"
         exit 1
     fi
     
@@ -644,8 +749,21 @@ configure_env() {
         cp .env .env.backup.$(date +%Y%m%d%H%M%S)
     fi
     
-    # Copy .env.example to .env
-    cp .env.example .env
+    # Copy .env.example to .env with error handling
+    print_info "Copying .env.example to .env..."
+    if ! cp .env.example .env; then
+        print_error "Failed to copy .env.example to .env"
+        
+        # Try to heal by creating .env directly
+        print_healing "Creating .env file directly..."
+        touch .env
+        
+        if [ ! -f ".env" ]; then
+            print_error "Cannot create .env file. Check permissions."
+            exit 1
+        fi
+    fi
+    
     print_success "Copied .env.example to .env"
     
     # Get bot token
@@ -654,50 +772,231 @@ configure_env() {
     print_warning "To get a bot token, visit: https://discord.com/developers/applications"
     BOT_TOKEN=$(get_password "Discord Bot Token")
     
+    # Validate bot token format (basic check)
+    if [ -z "$BOT_TOKEN" ]; then
+        print_error "Bot token cannot be empty"
+        exit 1
+    fi
+    
     # Update .env file
     print_info "Updating .env file with configuration..."
     
     # Database URL format for PostgreSQL
     DATABASE_URL="postgresql://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}"
     
-    # Use sed or perl to update the .env file
-    if command_exists sed; then
-        # Update individual variables
-        sed -i.bak "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=\"$DB_PASSWORD\"|" .env
-        sed -i.bak "s|^POSTGRES_USER=.*|POSTGRES_USER=\"$DB_USER\"|" .env
-        sed -i.bak "s|^DB_HOST=.*|DB_HOST=\"$DB_HOST\"|" .env
-        sed -i.bak "s|^DB_PORT=.*|DB_PORT=\"$DB_PORT\"|" .env
-        sed -i.bak "s|^POSTGRES_DB=.*|POSTGRES_DB=\"$DB_NAME\"|" .env
-        sed -i.bak "s|^BOT_TOKEN=.*|BOT_TOKEN=\"$BOT_TOKEN\"|" .env
+    # Try multiple methods to update .env file
+    local update_success=false
+    
+    # Method 1: Try GNU sed
+    if command_exists sed && ! $update_success; then
+        print_info "Updating .env using sed..."
         
-        # Add or update DATABASE_URL if it exists in the template
-        if grep -q "^DATABASE_URL=" .env; then
-            sed -i.bak "s|^DATABASE_URL=.*|DATABASE_URL=\"$DATABASE_URL\"|" .env
-        elif grep -q "^#DATABASE_URL=" .env; then
-            sed -i.bak "s|^#DATABASE_URL=.*|DATABASE_URL=\"$DATABASE_URL\"|" .env
+        # Create a backup
+        cp .env .env.tmp
+        
+        # Try to update with sed
+        if sed -i.bak "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=\"$DB_PASSWORD\"|" .env 2>/dev/null && \
+           sed -i.bak "s|^POSTGRES_USER=.*|POSTGRES_USER=\"$DB_USER\"|" .env 2>/dev/null && \
+           sed -i.bak "s|^DB_HOST=.*|DB_HOST=\"$DB_HOST\"|" .env 2>/dev/null && \
+           sed -i.bak "s|^DB_PORT=.*|DB_PORT=\"$DB_PORT\"|" .env 2>/dev/null && \
+           sed -i.bak "s|^POSTGRES_DB=.*|POSTGRES_DB=\"$DB_NAME\"|" .env 2>/dev/null && \
+           sed -i.bak "s|^BOT_TOKEN=.*|BOT_TOKEN=\"$BOT_TOKEN\"|" .env 2>/dev/null; then
+            
+            # Handle DATABASE_URL
+            if grep -q "^DATABASE_URL=" .env 2>/dev/null; then
+                sed -i.bak "s|^DATABASE_URL=.*|DATABASE_URL=\"$DATABASE_URL\"|" .env 2>/dev/null
+            elif grep -q "^#DATABASE_URL=" .env 2>/dev/null; then
+                sed -i.bak "s|^#DATABASE_URL=.*|DATABASE_URL=\"$DATABASE_URL\"|" .env 2>/dev/null
+            else
+                echo "" >> .env
+                echo "DATABASE_URL=\"$DATABASE_URL\"" >> .env
+            fi
+            
+            rm -f .env.bak .env.tmp
+            update_success=true
+            print_success "Updated .env using sed"
         else
-            echo "DATABASE_URL=\"$DATABASE_URL\"" >> .env
+            # Restore from backup if sed failed
+            if [ -f ".env.tmp" ]; then
+                mv .env.tmp .env
+            fi
+            print_warning "sed update failed, trying next method..."
+        fi
+    fi
+    
+    # Method 2: Try perl
+    if command_exists perl && ! $update_success; then
+        print_info "Updating .env using perl..."
+        
+        cp .env .env.tmp
+        
+        if perl -pi -e "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=\"$DB_PASSWORD\"/" .env 2>/dev/null && \
+           perl -pi -e "s/^POSTGRES_USER=.*/POSTGRES_USER=\"$DB_USER\"/" .env 2>/dev/null && \
+           perl -pi -e "s/^DB_HOST=.*/DB_HOST=\"$DB_HOST\"/" .env 2>/dev/null && \
+           perl -pi -e "s/^DB_PORT=.*/DB_PORT=\"$DB_PORT\"/" .env 2>/dev/null && \
+           perl -pi -e "s/^POSTGRES_DB=.*/POSTGRES_DB=\"$DB_NAME\"/" .env 2>/dev/null && \
+           perl -pi -e "s/^BOT_TOKEN=.*/BOT_TOKEN=\"$BOT_TOKEN\"/" .env 2>/dev/null; then
+            
+            if ! grep -q "^DATABASE_URL=" .env 2>/dev/null; then
+                echo "" >> .env
+                echo "DATABASE_URL=\"$DATABASE_URL\"" >> .env
+            else
+                perl -pi -e "s|^DATABASE_URL=.*|DATABASE_URL=\"$DATABASE_URL\"|" .env 2>/dev/null
+            fi
+            
+            rm -f .env.tmp
+            update_success=true
+            print_success "Updated .env using perl"
+        else
+            if [ -f ".env.tmp" ]; then
+                mv .env.tmp .env
+            fi
+            print_warning "perl update failed, trying next method..."
+        fi
+    fi
+    
+    # Method 3: Manual line-by-line update using awk
+    if ! $update_success; then
+        print_info "Updating .env using awk (fallback method)..."
+        
+        cp .env .env.tmp
+        
+        # Create update script
+        cat > /tmp/update_env.awk << 'AWKEOF'
+BEGIN {
+    db_pass = ENVIRON["DB_PASSWORD"]
+    db_user = ENVIRON["DB_USER"]
+    db_host = ENVIRON["DB_HOST"]
+    db_port = ENVIRON["DB_PORT"]
+    db_name = ENVIRON["DB_NAME"]
+    bot_token = ENVIRON["BOT_TOKEN"]
+    db_url = ENVIRON["DATABASE_URL"]
+    found_url = 0
+}
+/^POSTGRES_PASSWORD=/ { print "POSTGRES_PASSWORD=\"" db_pass "\""; next }
+/^POSTGRES_USER=/ { print "POSTGRES_USER=\"" db_user "\""; next }
+/^DB_HOST=/ { print "DB_HOST=\"" db_host "\""; next }
+/^DB_PORT=/ { print "DB_PORT=\"" db_port "\""; next }
+/^POSTGRES_DB=/ { print "POSTGRES_DB=\"" db_name "\""; next }
+/^BOT_TOKEN=/ { print "BOT_TOKEN=\"" bot_token "\""; next }
+/^DATABASE_URL=/ { print "DATABASE_URL=\"" db_url "\""; found_url = 1; next }
+/^#DATABASE_URL=/ { print "DATABASE_URL=\"" db_url "\""; found_url = 1; next }
+{ print }
+END {
+    if (found_url == 0) {
+        print ""
+        print "DATABASE_URL=\"" db_url "\""
+    }
+}
+AWKEOF
+        
+        if DB_PASSWORD="$DB_PASSWORD" DB_USER="$DB_USER" DB_HOST="$DB_HOST" \
+           DB_PORT="$DB_PORT" DB_NAME="$DB_NAME" BOT_TOKEN="$BOT_TOKEN" \
+           DATABASE_URL="$DATABASE_URL" awk -f /tmp/update_env.awk .env.tmp > .env.new 2>/dev/null && \
+           [ -s .env.new ]; then
+            
+            mv .env.new .env
+            rm -f .env.tmp /tmp/update_env.awk
+            update_success=true
+            print_success "Updated .env using awk"
+        else
+            if [ -f ".env.tmp" ]; then
+                mv .env.tmp .env
+            fi
+            rm -f .env.new /tmp/update_env.awk
+            print_warning "awk update failed, using final fallback..."
+        fi
+    fi
+    
+    # Method 4: Complete rewrite as last resort
+    if ! $update_success; then
+        print_healing "Using fallback method: complete .env rewrite..."
+        
+        # Read any additional variables from original .env.example
+        local additional_vars=""
+        if [ -f ".env.example" ]; then
+            additional_vars=$(grep -v "^POSTGRES_PASSWORD=" .env.example | \
+                             grep -v "^POSTGRES_USER=" | \
+                             grep -v "^DB_HOST=" | \
+                             grep -v "^DB_PORT=" | \
+                             grep -v "^POSTGRES_DB=" | \
+                             grep -v "^BOT_TOKEN=" | \
+                             grep -v "^DATABASE_URL=" | \
+                             grep -v "^#" | \
+                             grep -v "^$" || true)
         fi
         
-        rm -f .env.bak
-    else
-        # Manual update if sed is not available
         cat > .env << EOF
+# Database Configuration
 POSTGRES_PASSWORD="$DB_PASSWORD"
 POSTGRES_USER="$DB_USER"
 DB_HOST="$DB_HOST"
 DB_PORT="$DB_PORT"
 POSTGRES_DB="$DB_NAME"
-BOT_TOKEN="$BOT_TOKEN"
 DATABASE_URL="$DATABASE_URL"
+
+# Bot Configuration
+BOT_TOKEN="$BOT_TOKEN"
+
+# Additional Configuration
+$additional_vars
 EOF
+        
+        if [ -f ".env" ] && [ -s ".env" ]; then
+            update_success=true
+            print_success "Created new .env file"
+        else
+            print_error "Failed to create .env file"
+            exit 1
+        fi
+    fi
+    
+    # Verify the .env file was created and has content
+    if [ ! -f ".env" ] || [ ! -s ".env" ]; then
+        print_error ".env file is missing or empty"
+        exit 1
     fi
     
     # Validate .env file
     if ! validate_env_file; then
         print_error ".env file validation failed"
-        exit 1
+        print_healing "Attempting to fix .env file..."
+        
+        # Try to add missing variables
+        local missing_fixed=true
+        
+        if ! grep -q "^POSTGRES_PASSWORD=" .env; then
+            echo "POSTGRES_PASSWORD=\"$DB_PASSWORD\"" >> .env || missing_fixed=false
+        fi
+        if ! grep -q "^POSTGRES_USER=" .env; then
+            echo "POSTGRES_USER=\"$DB_USER\"" >> .env || missing_fixed=false
+        fi
+        if ! grep -q "^DB_HOST=" .env; then
+            echo "DB_HOST=\"$DB_HOST\"" >> .env || missing_fixed=false
+        fi
+        if ! grep -q "^DB_PORT=" .env; then
+            echo "DB_PORT=\"$DB_PORT\"" >> .env || missing_fixed=false
+        fi
+        if ! grep -q "^POSTGRES_DB=" .env; then
+            echo "POSTGRES_DB=\"$DB_NAME\"" >> .env || missing_fixed=false
+        fi
+        if ! grep -q "^BOT_TOKEN=" .env; then
+            echo "BOT_TOKEN=\"$BOT_TOKEN\"" >> .env || missing_fixed=false
+        fi
+        if ! grep -q "^DATABASE_URL=" .env; then
+            echo "DATABASE_URL=\"$DATABASE_URL\"" >> .env || missing_fixed=false
+        fi
+        
+        if $missing_fixed && validate_env_file; then
+            print_success ".env file fixed and validated"
+        else
+            print_error "Could not fix .env file. Manual intervention required."
+            exit 1
+        fi
     fi
+    
+    # Set proper permissions
+    chmod 600 .env 2>/dev/null || print_warning "Could not set .env permissions to 600"
     
     print_success ".env file configured successfully!"
     
